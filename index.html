@@ -1,0 +1,611 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Blob Classifier — Single File</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 0; padding: 0; display: flex; height: 100vh; }
+    #controls { width: 340px; padding: 16px; box-sizing: border-box; border-right: 1px solid #ddd; background:#fafafa; }
+    #main { flex: 1; display: flex; flex-direction: column; }
+    canvas { flex: 1; display:block; background: #fff; }
+    label { display:block; margin:8px 0 4px; font-weight:600; }
+    input[type=text], input[type=number], select { width:100%; padding:6px 8px; box-sizing:border-box; }
+    .row { display:flex; gap:8px; }
+    .btn { margin-top:12px; padding:8px 12px; cursor:pointer; border-radius:4px; border:1px solid #999; background:#f3f3f3; }
+    .btn.primary { background: #2563eb; color: white; border-color: #1e40af; }
+    .small { font-size: 13px; color:#555; }
+    .stat { margin-top:12px; font-weight:600; }
+    .hint { font-size:12px; color:#666; }
+  </style>
+</head>
+<body>
+  <div id="controls">
+    <h2>Blob Classifier</h2>
+    <label>Dataset</label>
+    <select id="datasetSelect">
+      <option value="quadrant4">Quadrant Blobs (4 classes)</option>
+      <option value="quadrant3split">Quadrant with 3 classes (one split)</option>
+      <option value="twomoons">Two Moons</option>
+    </select>
+
+    <label>Points per class</label>
+    <input id="pointsPerClass" type="number" min="10" value="120" />
+
+    <label>Variance (mixing)</label>
+    <input id="variance" type="number" step="0.01" min="0.01" value="0.25" />
+
+    <label>Moon distance (only for Two Moons)</label>
+    <input id="moonDistance" type="number" step="0.01" value="0.5" />
+
+    <label>Hidden layers (comma-separated, blank = none)</label>
+    <input id="hiddenLayers" type="text" placeholder="e.g. 8,4,2" />
+    <div class="hint">Enter nothing for no hidden layers (logistic/softmax).</div>
+
+    <label>Learning rate</label>
+    <input id="learningRate" type="number" step="0.0001" value="0.05" />
+
+    <label>Epochs</label>
+    <input id="epochs" type="number" min="1" value="300" />
+
+    <div class="row">
+      <button id="startBtn" class="btn primary">Start</button>
+      <button id="resetBtn" class="btn">Reset</button>
+    </div>
+
+    <div class="stat">Epoch: <span id="epochDisplay">0</span></div>
+    <div class="stat">Loss: <span id="lossDisplay">-</span></div>
+
+    <hr />
+    <div class="small">Tips:</div>
+    <ul class="small">
+      <li>Use small learning rates for deeper nets.</li>
+      <li>Increase variance to mix classes more.</li>
+      <li>Moon distance controls how separated the two moons are.</li>
+    </ul>
+  </div>
+
+  <div id="main">
+    <canvas id="plotCanvas"></canvas>
+  </div>
+
+  <script>
+  // Single-file blob classifier
+  // Basic utilities
+  function randn_bm() {
+    let u = 0, v = 0;
+    while(u === 0) u = Math.random();
+    while(v === 0) v = Math.random();
+    return Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v);
+  }
+
+  function parseHiddenLayers(s) {
+    if(!s) return [];
+    return s.split(',').map(x=>parseInt(x.trim())).filter(n=>Number.isFinite(n) && n>0);
+  }
+
+  // Dataset generators
+  function generateQuadrants(pointsPerClass, variance) {
+    const centers = [ [-1,1], [1,1], [-1,-1], [1,-1] ];
+    const xs = [], ys = [];
+    for(let i=0;i<centers.length;i++){
+      const c = centers[i];
+      for(let j=0;j<pointsPerClass;j++){
+        xs.push([c[0] + randn_bm()*variance, c[1] + randn_bm()*variance]);
+        ys.push(i);
+      }
+    }
+    return {X: xs, y: ys, classes: 4};
+  }
+
+  function generateQuadrantsSplitThree(pointsPerClass, variance) {
+    // We'll create four physical blobs, but use 3 labels where two opposite quadrants share a label
+    // Label assignment: top-left and bottom-right share class 0,
+    // top-right is class 1, bottom-left is class 2
+    const centers = [ [-1,1], [1,1], [-1,-1], [1,-1] ];
+    const labelMap = [0,1,2,0];
+    const xs = [], ys = [];
+    for(let i=0;i<centers.length;i++){
+      const c = centers[i];
+      for(let j=0;j<pointsPerClass;j++){
+        xs.push([c[0] + randn_bm()*variance, c[1] + randn_bm()*variance]);
+        ys.push(labelMap[i]);
+      }
+    }
+    return {X: xs, y: ys, classes: 3};
+  }
+
+  function generateTwoMoons(pointsPerClass, distance, variance) {
+    // Improved two-moons generator similar to sklearn.datasets.make_moons
+    // pointsPerClass = number of points per moon
+    const n = pointsPerClass;
+    const X = [], y = [];
+    for(let i=0;i<n;i++){
+      const t = Math.PI * Math.random();
+      const x = Math.cos(t);
+      const yv = Math.sin(t);
+      X.push([x, yv]);
+      y.push(0);
+    }
+    for(let i=0;i<n;i++){
+      const t = Math.PI * Math.random();
+      const x = 1 - Math.cos(t);
+      const yv = -Math.sin(t) - distance;
+      X.push([x, yv]);
+      y.push(1);
+    }
+    // add gaussian noise according to variance and then center the dataset
+    for(let i=0;i<X.length;i++){
+      X[i][0] += randn_bm() * variance;
+      X[i][1] += randn_bm() * variance;
+    }
+    // center data around origin for better visualization
+    const mean = X.reduce((acc,v)=>{ acc[0]+=v[0]; acc[1]+=v[1]; return acc; }, [0,0]);
+    mean[0] /= X.length; mean[1] /= X.length;
+    for(let i=0;i<X.length;i++){ X[i][0] -= mean[0]; X[i][1] -= mean[1]; }
+    return {X, y, classes: 2};
+  }
+
+  // Simple neural network (vanilla SGD)
+  class NeuralNet {
+    constructor(layerSizes) {
+      this.sizes = layerSizes.slice();
+      this.L = this.sizes.length - 1;
+      this.W = [];
+      this.b = [];
+      for(let i=0;i<this.L;i++){
+        const inS = this.sizes[i];
+        const outS = this.sizes[i+1];
+        // Xavier init
+        const scale = Math.sqrt(2 / (inS + outS));
+        let w = new Array(outS).fill(0).map(()=> new Array(inS).fill(0).map(()=> (Math.random()*2-1)*scale ));
+        let b = new Array(outS).fill(0);
+        this.W.push(w);
+        this.b.push(b);
+      }
+    }
+
+    paramCount() {
+      let cnt = 0;
+      for(let l=0;l<this.W.length;l++){
+        cnt += this.W[l].length * (this.W[l][0] ? this.W[l][0].length : 0);
+        cnt += this.b[l].length;
+      }
+      return cnt;
+    }
+
+    forward(x) {
+      // x is array [N][D]
+      let a = x; // array of vectors
+      const caches = [];
+      for(let l=0;l<this.L-1;l++){
+        const z = a.map(v => addVec(matVecMul(this.W[l], v), this.b[l]));
+        const a2 = z.map(v => v.map(vv => Math.max(0, vv))); // ReLU
+        caches.push({z, a, type:'relu'});
+        a = a2;
+      }
+      // last layer linear -> softmax
+      const l = this.L-1;
+      const z = a.map(v => addVec(matVecMul(this.W[l], v), this.b[l]));
+      const aOut = z.map(softmax);
+      caches.push({z, a, type:'softmax'});
+      return {out: aOut, caches};
+    }
+
+    // yOneHot: [N][C]
+    step(x, yOneHot, lr) {
+      const N = x.length;
+      const f = this.forward(x);
+      const out = f.out; // probabilities
+      // compute loss and gradient on output
+      let loss = 0;
+      // dL/dz for last layer
+      const last = f.caches[f.caches.length-1];
+      const aPrev = last.a; // activation before last layer
+      const dZlast = new Array(N);
+      for(let i=0;i<N;i++){
+        const p = out[i];
+        const t = yOneHot[i];
+        for(let k=0;k<p.length;k++){
+          loss += - (t[k] > 0 ? Math.log(p[k] + 1e-12) : 0);
+        }
+        dZlast[i] = p.map((pv,k)=> pv - t[k]);
+      }
+      loss /= N;
+
+      // Gradients for last layer
+      const gradsW = new Array(this.L).fill(0).map(()=>null);
+      const gradsb = new Array(this.L).fill(0).map(()=>null);
+      // compute dW and db for last layer
+      const lidx = this.L-1;
+      const outDim = this.sizes[lidx+1];
+      const inDim = this.sizes[lidx];
+      const dWlast = new Array(outDim).fill(0).map(()=> new Array(inDim).fill(0));
+      const dblast = new Array(outDim).fill(0);
+      for(let i=0;i<N;i++){
+        const dz = dZlast[i];
+        const a = aPrev[i];
+        for(let o=0;o<outDim;o++){
+          dblast[o] += dz[o];
+          for(let j=0;j<inDim;j++) dWlast[o][j] += dz[o] * a[j];
+        }
+      }
+      for(let o=0;o<outDim;o++){
+        dblast[o] /= N;
+        for(let j=0;j<inDim;j++) dWlast[o][j] /= N;
+      }
+      gradsW[lidx] = dWlast; gradsb[lidx] = dblast;
+
+      // backpropagate through hidden layers
+      let dA = new Array(N).fill(0).map(()=> new Array(outDim).fill(0));
+      for(let i=0;i<N;i++) dA[i] = dZlast[i].slice();
+      for(let l=this.L-1; l>0; l--){
+        // compute dA_prev = W^T * dZ
+        const W = this.W[l]; // outDim x inDim
+        const Wt = transpose(W);
+        const dZ = new Array(N).fill(0).map(()=> new Array(Wt[0].length).fill(0));
+        for(let i=0;i<N;i++){
+          const da = dA[i];
+          const vec = matVecMul(Wt, da);
+          dZ[i] = vec;
+        }
+        // now apply ReLU derivative using caches[l-1]
+        const cache = f.caches[l-1];
+        const zcache = cache.z; // before activation
+        for(let i=0;i<N;i++){
+          for(let j=0;j<zcache[i].length;j++){
+            if(zcache[i][j] <= 0) dZ[i][j] = 0;
+          }
+        }
+        // compute dW and db for layer l-1
+        const inPrev = this.sizes[l-1];
+        const outPrev = this.sizes[l];
+        const dW = new Array(outPrev).fill(0).map(()=> new Array(inPrev).fill(0));
+        const db = new Array(outPrev).fill(0);
+        const aPrevLayer = cache.a;
+        for(let i=0;i<N;i++){
+          for(let o=0;o<outPrev;o++){
+            db[o] += dZ[i][o];
+            for(let j=0;j<inPrev;j++) dW[o][j] += dZ[i][o] * aPrevLayer[i][j];
+          }
+        }
+        for(let o=0;o<outPrev;o++){
+          db[o] /= N;
+          for(let j=0;j<inPrev;j++) dW[o][j] /= N;
+        }
+        gradsW[l-1] = dW; gradsb[l-1] = db;
+        dA = dZ; // continue
+      }
+
+      // update params
+      for(let l=0;l<this.L;l++){
+        const W = this.W[l];
+        const gW = gradsW[l];
+        const gb = gradsb[l];
+        for(let o=0;o<W.length;o++){
+          for(let j=0;j<W[0].length;j++){
+            W[o][j] -= lr * gW[o][j];
+          }
+          this.b[l][o] -= lr * gb[o];
+        }
+      }
+
+      return loss;
+    }
+
+    predict(x) {
+      const out = this.forward(x).out;
+      return out.map(p => argMax(p));
+    }
+  }
+
+  // Matrix helpers
+  function matVecMul(mat, vec) {
+    const out = new Array(mat.length).fill(0);
+    for(let i=0;i<mat.length;i++){
+      let s = 0;
+      const row = mat[i];
+      for(let j=0;j<row.length;j++) s += row[j]*vec[j];
+      out[i] = s;
+    }
+    return out;
+  }
+  function addVec(a,b){ return a.map((v,i)=> v + b[i]); }
+  function transpose(mat){
+    const R = mat[0].length, C = mat.length;
+    const out = new Array(R).fill(0).map(()=> new Array(C).fill(0));
+    for(let i=0;i<C;i++) for(let j=0;j<R;j++) out[j][i] = mat[i][j];
+    return out;
+  }
+  function softmax(vec){
+    const m = Math.max(...vec);
+    const ex = vec.map(v=> Math.exp(v - m));
+    const s = ex.reduce((a,b)=>a+b,0) + 1e-12;
+    return ex.map(v=> v/s);
+  }
+  function argMax(arr){ let mi=0; for(let i=1;i<arr.length;i++) if(arr[i]>arr[mi]) mi=i; return mi; }
+
+  // UI and plotting
+  const canvas = document.getElementById('plotCanvas');
+  const ctx = canvas.getContext('2d');
+  let width = 800, height = 600;
+  function resize() {
+    // size canvas to match its parent container while keeping reasonable min sizes
+    const pw = canvas.parentElement.clientWidth;
+    const ph = canvas.parentElement.clientHeight;
+    // set CSS size so it lays out correctly, and set backing store size for high-DPI
+    canvas.style.width = pw + 'px';
+    canvas.style.height = ph + 'px';
+    canvas.width = Math.max(300, Math.floor(pw * (window.devicePixelRatio || 1)));
+    canvas.height = Math.max(200, Math.floor(ph * (window.devicePixelRatio || 1)));
+    ctx.setTransform(window.devicePixelRatio || 1,0,0,window.devicePixelRatio || 1,0,0);
+    draw();
+  }
+  window.addEventListener('resize', resize);
+
+  let data = null;
+  let model = null;
+  let training = false;
+  let currentEpoch = 0;
+  let currentLoss = 0;
+
+  function toCanvasCoords(p) {
+    // map [-2,2] x [-2,2] to canvas
+    const pad = 20;
+    const x = (p[0] + 2) / 4 * (canvas.clientWidth - 2*pad) + pad;
+    const y = (1 - (p[1] + 2) / 4) * (canvas.clientHeight - 2*pad) + pad;
+    return [x,y];
+  }
+
+  function canvasToData(cx, cy) {
+    const pad = 20;
+    const nx = (cx - pad) / (canvas.clientWidth - 2*pad);
+    const ny = (cy - pad) / (canvas.clientHeight - 2*pad);
+    const dx = nx * 4 - 2;
+    const dy = (1 - ny) * 4 - 2;
+    return [dx, dy];
+  }
+
+  function drawBackground() {
+    if(!model) return;
+    // adapt grid resolution for large models to keep training responsive
+    const paramCount = model.paramCount ? model.paramCount() : 0;
+    const base = Math.min(canvas.clientWidth, canvas.clientHeight);
+    const step = Math.max(6, Math.floor(base / (paramCount > 2000 ? 28 : 80)));
+    const colors = ['#ef4444','#10b981','#3b82f6','#f59e0b'];
+    const pts = [];
+    const coords = [];
+    for(let y=0;y<canvas.clientHeight;y+=step){
+      for(let x=0;x<canvas.clientWidth;x+=step){
+        const d = canvasToData(x+step/2, y+step/2);
+        pts.push(d);
+        coords.push([x,y]);
+      }
+    }
+    if(pts.length===0) return;
+    let preds;
+    if(model) {
+      preds = model.predict(pts);
+    } else if(data && data.X) {
+      // no model: color by nearest training point label (quick Voronoi-like fill)
+      preds = pts.map(p => {
+        let best = 0; let bd = Infinity;
+        for(let i=0;i<data.X.length;i++){
+          const dx = data.X[i][0]-p[0];
+          const dy = data.X[i][1]-p[1];
+          const d = dx*dx + dy*dy;
+          if(d < bd){ bd = d; best = data.y[i]; }
+        }
+        return best;
+      });
+    } else {
+      return;
+    }
+    // paint background cells
+    ctx.globalAlpha = 0.12;
+    for(let i=0;i<preds.length;i++){
+      const lab = preds[i] % colors.length;
+      ctx.fillStyle = colors[lab];
+      const [x,y] = coords[i];
+      ctx.fillRect(x, y, step, step);
+    }
+    ctx.globalAlpha = 1;
+
+    // draw boundary lines between adjacent cells with different predictions
+    const cols = Math.ceil(canvas.clientWidth / step);
+    const rows = Math.ceil(canvas.clientHeight / step);
+    ctx.beginPath();
+    ctx.strokeStyle = 'rgba(0,0,0,0.25)';
+    ctx.lineWidth = 1;
+    for(let r=0;r<rows;r++){
+      for(let c=0;c<cols;c++){
+        const idx = r*cols + c;
+        if(idx >= preds.length) continue;
+        const p = preds[idx];
+        // right neighbor
+        const idxR = idx + 1;
+        if(c < cols-1 && idxR < preds.length && preds[idxR] !== p){
+          const x = coords[idx][0] + step;
+          const y = coords[idx][1];
+          ctx.moveTo(x+0.5, y+0.5);
+          ctx.lineTo(x+0.5, y + step + 0.5);
+        }
+        // bottom neighbor
+        const idxB = idx + cols;
+        if(r < rows-1 && idxB < preds.length && preds[idxB] !== p){
+          const x = coords[idx][0];
+          const y = coords[idx][1] + step;
+          ctx.moveTo(x+0.5, y+0.5);
+          ctx.lineTo(x + step + 0.5, y+0.5);
+        }
+      }
+    }
+    ctx.stroke();
+  }
+
+  function draw() {
+    ctx.clearRect(0,0,canvas.clientWidth, canvas.clientHeight);
+    if(!data) return;
+    // draw decision-boundary background if model exists
+    // but skip heavy background shading while training large models
+    if(!(training && model && model.paramCount && model.paramCount() > 2000)){
+      drawBackground();
+    }
+    // draw points colored by true label; stroke by predicted label
+    const preds = model ? model.predict(data.X) : null;
+    for(let i=0;i<data.X.length;i++){
+      const p = data.X[i];
+      const label = data.y[i];
+      const [x,y] = toCanvasCoords(p);
+      const colors = ['#ef4444','#10b981','#3b82f6','#f59e0b'];
+      ctx.beginPath();
+      ctx.fillStyle = colors[label%colors.length];
+      ctx.globalAlpha = 0.95;
+      ctx.arc(x,y,4,0,Math.PI*2);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+      if(preds){
+        if(preds[i] !== label){
+          ctx.strokeStyle = '#000'; ctx.lineWidth = 1; ctx.stroke();
+        } else {
+          ctx.strokeStyle = 'rgba(0,0,0,0.15)'; ctx.lineWidth = 1; ctx.stroke();
+        }
+      }
+    }
+  }
+
+  // Helpers to create yOneHot
+  function makeOneHot(y, C){
+    return y.map(v=>{ const arr = new Array(C).fill(0); arr[v]=1; return arr; });
+  }
+
+  async function trainLoop(epochs, lr, onUpdate) {
+    const X = data.X;
+    const Y = makeOneHot(data.y, data.classes);
+    const batch = X.length;
+    // adapt redraw frequency based on model complexity: fewer redraws for larger models
+    let drawEvery;
+    if(model && model.paramCount){
+      const params = model.paramCount();
+      drawEvery = params > 2000 ? Math.max(1, Math.floor(epochs/50)) : Math.max(1, Math.floor(epochs/200));
+    } else {
+      drawEvery = Math.max(1, Math.floor(epochs/200));
+    }
+    for(let e=1;e<=epochs && training;e++){
+      const loss = model.step(X, Y, lr);
+      currentEpoch = e; currentLoss = loss;
+      // Always update epoch/loss display every epoch (keeps step = 1)
+      onUpdate(e, loss);
+      // Only redraw the heavier visualization occasionally for performance
+      if(e % drawEvery === 0 || e===1 || e===epochs) {
+        draw();
+        // yield to UI thread so the page remains responsive
+        await new Promise(r=>setTimeout(r, 0));
+      }
+    }
+    training = false;
+    onUpdate(currentEpoch, currentLoss);
+    // Final full redraw after training finishes (ensures background is shown for large models)
+    draw();
+  }
+
+  // Wire UI
+  const datasetSelect = document.getElementById('datasetSelect');
+  const pointsPerClassInput = document.getElementById('pointsPerClass');
+  const varianceInput = document.getElementById('variance');
+  const moonDistanceInput = document.getElementById('moonDistance');
+  const hiddenLayersInput = document.getElementById('hiddenLayers');
+  const lrInput = document.getElementById('learningRate');
+  const epochsInput = document.getElementById('epochs');
+  const startBtn = document.getElementById('startBtn');
+  const resetBtn = document.getElementById('resetBtn');
+  const epochDisplay = document.getElementById('epochDisplay');
+  const lossDisplay = document.getElementById('lossDisplay');
+
+  // update dataset when selection changes
+  datasetSelect.addEventListener('change', ()=>{
+    // regenerate dataset and clear any trained model
+    generateDataFromUI();
+    model = null;
+    epochDisplay.textContent = '0';
+    lossDisplay.textContent = '-';
+    draw();
+  });
+
+  // debounce helper to avoid regenerating too often while user types
+  function debounce(fn, wait=150){
+    let t = null;
+    return (...args)=>{
+      if(t) clearTimeout(t);
+      t = setTimeout(()=>{ t=null; fn(...args); }, wait);
+    };
+  }
+
+  // regenerate dataset when key settings change
+  const regenDebounced = debounce(()=>{
+    generateDataFromUI();
+    model = null;
+    epochDisplay.textContent = '0';
+    lossDisplay.textContent = '-';
+    draw();
+  }, 120);
+
+  // Only regenerate dataset when inputs that affect the data change.
+  pointsPerClassInput.addEventListener('input', regenDebounced);
+  varianceInput.addEventListener('input', regenDebounced);
+  moonDistanceInput.addEventListener('input', regenDebounced);
+
+  function generateDataFromUI(){
+    const pts = parseInt(pointsPerClassInput.value) || 100;
+    const varin = parseFloat(varianceInput.value) || 0.25;
+    const dist = parseFloat(moonDistanceInput.value) || 0.5;
+    const ds = datasetSelect.value;
+    if(ds === 'quadrant4') data = generateQuadrants(pts, varin);
+    else if(ds === 'quadrant3split') data = generateQuadrantsSplitThree(pts, varin);
+    else data = generateTwoMoons(pts, dist, varin);
+    // normalize data a bit to fit [-2,2]
+    // compute bounding box
+    draw();
+  }
+
+  function buildModelFromUI() {
+    const hidden = parseHiddenLayers(hiddenLayersInput.value);
+    const inSize = 2;
+    const outSize = data.classes;
+    const layers = [inSize].concat(hidden).concat([outSize]);
+    model = new NeuralNet(layers);
+  }
+
+  startBtn.addEventListener('click', async ()=>{
+    if(training) return;
+    // Train on the currently displayed dataset (do not re-randomize points on Start).
+    buildModelFromUI();
+    const lr = parseFloat(lrInput.value) || 0.05;
+    const epochs = parseInt(epochsInput.value) || 200;
+    training = true;
+    epochDisplay.textContent = '0';
+    lossDisplay.textContent = '-';
+    await trainLoop(epochs, lr, (e, loss)=>{
+      epochDisplay.textContent = e;
+      lossDisplay.textContent = loss.toFixed(5);
+    });
+  });
+
+  resetBtn.addEventListener('click', ()=>{
+    training = false;
+    generateDataFromUI();
+    model = null;
+    epochDisplay.textContent = '0';
+    lossDisplay.textContent = '-';
+    draw();
+  });
+
+  // init
+  generateDataFromUI();
+  resize();
+  draw();
+
+  // small math utilities to keep patch compact
+  </script>
+</body>
+</html>
