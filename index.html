@@ -339,6 +339,8 @@
     canvas.width = Math.max(300, Math.floor(pw * (window.devicePixelRatio || 1)));
     canvas.height = Math.max(200, Math.floor(ph * (window.devicePixelRatio || 1)));
     ctx.setTransform(window.devicePixelRatio || 1,0,0,window.devicePixelRatio || 1,0,0);
+    // invalidate background grid cache on resize so coordinates and sampling are recomputed
+    bgGridCache = {};
     draw();
   }
   window.addEventListener('resize', resize);
@@ -348,6 +350,8 @@
   let training = false;
   let currentEpoch = 0;
   let currentLoss = 0;
+  // cache precomputed grid points keyed by step size to avoid recomputing every draw
+  let bgGridCache = {};
 
   function toCanvasCoords(p) {
     // map [-2,2] x [-2,2] to canvas
@@ -367,28 +371,46 @@
   }
 
   function drawBackground() {
-    if(!model) return;
-    // adapt grid resolution for large models to keep training responsive
-    const paramCount = model.paramCount ? model.paramCount() : 0;
-    const base = Math.min(canvas.clientWidth, canvas.clientHeight);
-    const step = Math.max(6, Math.floor(base / (paramCount > 2000 ? 28 : 80)));
-    const colors = ['#ef4444','#10b981','#3b82f6','#f59e0b'];
-    const pts = [];
-    const coords = [];
-    for(let y=0;y<canvas.clientHeight;y+=step){
-      for(let x=0;x<canvas.clientWidth;x+=step){
-        const d = canvasToData(x+step/2, y+step/2);
-        pts.push(d);
-        coords.push([x,y]);
-      }
+    // Choose sampling resolution adaptively. During training we aim for fewer cells
+    const paramCount = model && model.paramCount ? model.paramCount() : 0;
+    const area = canvas.clientWidth * canvas.clientHeight;
+    const targetPoints = training ? 4500 : 20000; // aim for ~targetPoints samples
+    let step = Math.max(4, Math.floor(Math.sqrt(area / targetPoints)));
+    // enforce a minimum visual step for clarity
+    step = Math.max(6, step);
+    // if the model is very large, bias to coarser sampling while training
+    if(training && paramCount > 2000) {
+      const scale = Math.ceil(paramCount / 2000);
+      step = Math.max(step, step * scale);
     }
-    if(pts.length===0) return;
+
+    const colors = ['#ef4444','#10b981','#3b82f6','#f59e0b'];
+
+    // use cached grid for this step if available
+    let grid = bgGridCache[step];
+    if(!grid){
+      const pts = [];
+      const coords = [];
+      for(let y=0;y<canvas.clientHeight;y+=step){
+        for(let x=0;x<canvas.clientWidth;x+=step){
+          const d = canvasToData(x+step/2, y+step/2);
+          pts.push(d);
+          coords.push([x,y]);
+        }
+      }
+      grid = {pts, coords, step, cols: Math.ceil(canvas.clientWidth/step), rows: Math.ceil(canvas.clientHeight/step)};
+      bgGridCache[step] = grid;
+    }
+
+    if(grid.pts.length === 0) return;
+
+    // get predictions (fast when grid is coarse)
     let preds;
-    if(model) {
-      preds = model.predict(pts);
-    } else if(data && data.X) {
-      // no model: color by nearest training point label (quick Voronoi-like fill)
-      preds = pts.map(p => {
+    if(model){
+      preds = model.predict(grid.pts);
+    } else if(data && data.X){
+      // fallback nearest-neighbor coloring when no model exists
+      preds = grid.pts.map(p => {
         let best = 0; let bd = Infinity;
         for(let i=0;i<data.X.length;i++){
           const dx = data.X[i][0]-p[0];
@@ -401,19 +423,20 @@
     } else {
       return;
     }
+
     // paint background cells
     ctx.globalAlpha = 0.12;
     for(let i=0;i<preds.length;i++){
       const lab = preds[i] % colors.length;
       ctx.fillStyle = colors[lab];
-      const [x,y] = coords[i];
-      ctx.fillRect(x, y, step, step);
+      const [x,y] = grid.coords[i];
+      ctx.fillRect(x, y, grid.step, grid.step);
     }
     ctx.globalAlpha = 1;
 
     // draw boundary lines between adjacent cells with different predictions
-    const cols = Math.ceil(canvas.clientWidth / step);
-    const rows = Math.ceil(canvas.clientHeight / step);
+    const cols = grid.cols;
+    const rows = grid.rows;
     ctx.beginPath();
     ctx.strokeStyle = 'rgba(0,0,0,0.25)';
     ctx.lineWidth = 1;
@@ -425,18 +448,18 @@
         // right neighbor
         const idxR = idx + 1;
         if(c < cols-1 && idxR < preds.length && preds[idxR] !== p){
-          const x = coords[idx][0] + step;
-          const y = coords[idx][1];
+          const x = grid.coords[idx][0] + grid.step;
+          const y = grid.coords[idx][1];
           ctx.moveTo(x+0.5, y+0.5);
-          ctx.lineTo(x+0.5, y + step + 0.5);
+          ctx.lineTo(x+0.5, y + grid.step + 0.5);
         }
         // bottom neighbor
         const idxB = idx + cols;
         if(r < rows-1 && idxB < preds.length && preds[idxB] !== p){
-          const x = coords[idx][0];
-          const y = coords[idx][1] + step;
+          const x = grid.coords[idx][0];
+          const y = grid.coords[idx][1] + grid.step;
           ctx.moveTo(x+0.5, y+0.5);
-          ctx.lineTo(x + step + 0.5, y+0.5);
+          ctx.lineTo(x + grid.step + 0.5, y+0.5);
         }
       }
     }
@@ -446,11 +469,8 @@
   function draw() {
     ctx.clearRect(0,0,canvas.clientWidth, canvas.clientHeight);
     if(!data) return;
-    // draw decision-boundary background if model exists
-    // but skip heavy background shading while training large models
-    if(!(training && model && model.paramCount && model.paramCount() > 2000)){
-      drawBackground();
-    }
+    // draw decision-boundary background (adaptive/coarse while training)
+    drawBackground();
     // draw points colored by true label; stroke by predicted label
     const preds = model ? model.predict(data.X) : null;
     for(let i=0;i<data.X.length;i++){
